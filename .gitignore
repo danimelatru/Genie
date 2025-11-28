@@ -1,0 +1,29 @@
+# Conda environment
+env/
+*/env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Datasets
+data/
+datasets/
+*.npz
+*.npy
+*.pt
+
+# Logs
+logs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# SLURM
+slurm-*.out
+slurm-*.err
+
+# VSCode
+.vscode/
