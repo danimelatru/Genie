@@ -10,7 +10,7 @@ from pathlib import Path
 
 # --- CONFIGURATION ---
 BATCH_SIZE = 128
-LEARNING_RATE = 2e-4    # Slightly slower to be careful
+LEARNING_RATE = 2e-4
 EMBEDDING_DIM = 64      
 NUM_EMBEDDINGS = 512    # Doubled vocabulary size
 EPOCHS = 20             # Give it time to learn the hard parts
