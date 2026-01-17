@@ -20,6 +20,7 @@ logs/
 
 # Jupyter
 .ipynb_checkpoints/
+notebooks/
 
 # SLURM
 slurm-*.out

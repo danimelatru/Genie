@@ -25,7 +25,7 @@ sys.path.append(str(root_path))
 DATA_PATH = root_path / "data" / "tokens"
 ARTIFACTS_PATH = root_path / "data" / "artifacts"
 
-# --- 1. DATASET (RAM SAFE VERSION) ---
+# --- 1. DATASET ---
 class TokenTransitionsDataset(Dataset):
     def __init__(self, data_dir, limit=2000):
         self.files = sorted(list(Path(data_dir).glob("*.npz")))
