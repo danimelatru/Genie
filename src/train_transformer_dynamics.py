@@ -1,291 +1,202 @@
 import os
-import sys
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
-from pathlib import Path
+from collections import Counter
 
-# --- CONFIGURATION ---
-BATCH_SIZE = 64              # Reduced batch size for Transformer memory
-LEARNING_RATE = 3e-4         # Lower LR for Transformer stability
-EPOCHS = 100                  # Increased epochs to give time for convergence
-NUM_LATENT_ACTIONS = 8       # Number of discrete actions to discover
-TOKEN_VOCAB = 512            # Must match VQ-VAE codebook size
-SEQ_LEN = 256                # 16x16 tokens flattened
-EMBED_DIM = 128              # Transformer internal dimension
+# --- IMPORTS ---
+try:
+    from train_vqvae import VQVAE
+except ImportError:
+    import sys
+    sys.path.append(str(Path(__file__).parent))
+    from train_vqvae import VQVAE
+
+# --- CONFIG ---
+BATCH_SIZE = 32
+LEARNING_RATE = 1e-4
+EPOCHS = 10
+HIDDEN_DIM = 256
 NUM_HEADS = 4
 NUM_LAYERS = 4
-DROPOUT = 0.1
+VOCAB_SIZE = 512
+NUM_ACTIONS = 8
+ENTROPY_WEIGHT = 0.001
+EMBED_DIM = 64
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- PATH SETUP ---
-current_path = Path(__file__).parent.resolve()
-root_path = current_path.parent
-sys.path.append(str(root_path))
-DATA_PATH = root_path / "data" / "tokens"
-ARTIFACTS_PATH = root_path / "data" / "artifacts"
+PROJECT_ROOT = Path(__file__).parent.parent
+DATA_PATH = PROJECT_ROOT / "data" / "tokens"
+ARTIFACTS_PATH = PROJECT_ROOT / "data" / "artifacts"
 ARTIFACTS_PATH.mkdir(parents=True, exist_ok=True)
 
-# --- 1. DATASET ---
+# --- DATASET ---
 class TokenTransitionsDataset(Dataset):
-    def __init__(self, data_dir, limit=10000, min_diff_tokens=1):
-        self.files = sorted(list(Path(data_dir).glob("*.npz")))
-        if len(self.files) > limit:
-            self.files = self.files[:limit]
+    def __init__(self, token_dir, limit=None):
+        self.files = sorted(list(Path(token_dir).glob("*.npy")))
+        if limit: self.files = self.files[:limit]
+        
+        self.data = []
+        all_actions_debug = []
         
         print(f"Loading {len(self.files)} episodes...")
         
-        self.transitions = []
-        self.real_actions = [] 
-        
-        total_transitions = 0
-        kept_transitions = 0
-        
         for f in self.files:
-            with np.load(f) as data:
-                tokens = data["tokens"] # (T, 16, 16)
-                actions = data["actions"] # (T, 2)
+            try:
+                tokens = np.load(f) 
+                if len(tokens.shape) != 3: continue
+
+                action_file = str(f).replace("tokens", "actions")
+                if not os.path.exists(action_file):
+                     action_file = str(f).replace("_tokens.npy", "_actions.npy")
                 
-                # --- FILTRO DE MOVIMIENTO ---
-                # Compute how many tokens change between t and t+1
-                # tokens[:-1] is the actual state, tokens[1:] is the next one
-                diff_map = (tokens[:-1] != tokens[1:])
-                # Sum all changes per frame (axis 1 and 2)
-                changes_per_frame = np.sum(diff_map, axis=(1, 2))
+                if not os.path.exists(action_file): continue
+                actions = np.load(action_file)
+
+                # Debug
+                all_actions_debug.extend(actions.tolist())
+
+                limit_len = min(len(tokens) - 1, len(actions))
                 
-                # Only keep index with at least 'min_diff_tokens' changes
-                # Deletes frames where agent stayed still or the VQVAE didn't percieve movement
-                interesting_indices = np.where(changes_per_frame >= min_diff_tokens)[0]
-                
-                if len(interesting_indices) == 0:
-                    continue
-                    
-                # Select interesting frames
-                current_steps = tokens[interesting_indices]
-                next_steps = tokens[interesting_indices + 1]
-                agent_0_actions = actions[interesting_indices, 0] 
-                
-                self.transitions.append(np.stack([current_steps, next_steps], axis=1))
-                self.real_actions.append(agent_0_actions)
-                
-                total_transitions += (len(tokens) - 1)
-                kept_transitions += len(interesting_indices)
-                
-        self.transitions = np.concatenate(self.transitions, axis=0)
-        self.real_actions = np.concatenate(self.real_actions, axis=0)
+                for i in range(limit_len):
+                    curr = tokens[i]
+                    nxt = tokens[i+1]
+                    if np.array_equal(curr, nxt): continue 
+                    self.data.append((curr, nxt, actions[i]))
+            except: continue
         
-        print(f"--- DATASET CURATION REPORT ---")
-        print(f"Original Transitions: {total_transitions}")
-        print(f"Kept (Moving) Transitions: {kept_transitions}")
-        print(f"Discarded (Static): {total_transitions - kept_transitions} ({100*(1 - kept_transitions/total_transitions):.1f}%)")
-        print(f"This forces the model to learn DYNAMICS, not background copying.")
-        print(f"-------------------------------")
+        # Actions debug
+        print(f"--- ACTION DISTRIBUTION REPORT ---")
+        counts = Counter(all_actions_debug)
+        print(f"Unique Actions found in files: {sorted(counts.keys())}")
+        print(f"Counts: {dict(counts)}")
+        print(f"Total Transitions: {len(self.data)}") 
+        print(f"----------------------------------")
 
     def __len__(self):
-        return len(self.transitions)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        trans = torch.from_numpy(self.transitions[idx]).long()
-        real_act = torch.tensor(self.real_actions[idx]).long()
-        return trans[0], trans[1], real_act
+        curr, nxt, act = self.data[idx]
+        return torch.LongTensor(curr), torch.LongTensor(nxt), torch.LongTensor([act])
 
-# --- 2. MODELS ---
-
+# --- MODELS ---
 class ActionRecognitionNet(nn.Module):
-    """
-    Inverse Model: Infers action a_t from state z_t and z_{t+1}.
-    Uses CNNs because movement is a spatial phenomenon.
-    """
     def __init__(self):
         super().__init__()
-        self.embedding = nn.Embedding(TOKEN_VOCAB, 32)
-        
-        # Input: 2 frames stacked (channels)
-        # 16x16 input -> CNN -> Global Average Pooling
+        self.embedding = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
         self.conv_net = nn.Sequential(
-            nn.Conv2d(32 * 2, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(EMBED_DIM * 2, 64, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1, stride=2), # 8x8
-            nn.BatchNorm2d(128),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1, stride=2), # 4x4
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
             nn.ReLU()
         )
-        
         self.head = nn.Sequential(
             nn.Flatten(),
             nn.Linear(128 * 4 * 4, 256),
             nn.ReLU(),
-            nn.Linear(256, NUM_LATENT_ACTIONS)
+            nn.Linear(256, NUM_ACTIONS)
         )
 
     def forward(self, z_t, z_next):
-        # z: (B, 16, 16)
-        emb_t = self.embedding(z_t).permute(0, 3, 1, 2)       # (B, 32, 16, 16)
-        emb_next = self.embedding(z_next).permute(0, 3, 1, 2) # (B, 32, 16, 16)
-        
-        x = torch.cat([emb_t, emb_next], dim=1) # (B, 64, 16, 16)
-        feat = self.conv_net(x)
-        logits = self.head(feat)
-        return logits
-
+        emb_t = self.embedding(z_t).permute(0, 3, 1, 2)
+        emb_next = self.embedding(z_next).permute(0, 3, 1, 2) 
+        x = torch.cat([emb_t, emb_next], dim=1)
+        return self.head(self.conv_net(x))
 
 class WorldModelTransformer(nn.Module):
-    """
-    Forward Model: Predicts z_{t+1} given z_t and action a_t.
-    Architecture: GPT-style Decoder (Causal/Parallel).
-    """
     def __init__(self):
         super().__init__()
-        
-        # Embeddings
-        self.token_embedding = nn.Embedding(TOKEN_VOCAB, EMBED_DIM)
-        self.pos_embedding = nn.Parameter(torch.randn(1, SEQ_LEN, EMBED_DIM))
-        self.action_embedding = nn.Embedding(NUM_LATENT_ACTIONS, EMBED_DIM)
-        
-        # Transformer
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=EMBED_DIM, 
-            nhead=NUM_HEADS, 
-            dim_feedforward=EMBED_DIM*4, 
-            dropout=DROPOUT,
-            batch_first=True
-        )
+        self.embedding = nn.Embedding(VOCAB_SIZE, HIDDEN_DIM)
+        self.action_emb = nn.Linear(NUM_ACTIONS, HIDDEN_DIM)
+        self.pos_emb = nn.Parameter(torch.randn(1, 16*16, HIDDEN_DIM))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=HIDDEN_DIM, nhead=NUM_HEADS, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=NUM_LAYERS)
-        
-        # Output Head
-        self.head = nn.Linear(EMBED_DIM, TOKEN_VOCAB)
+        self.head = nn.Linear(HIDDEN_DIM, VOCAB_SIZE)
 
     def forward(self, z_t, action_probs):
-        # z_t: (B, 16, 16) -> Flatten to (B, 256)
-        b, h, w = z_t.shape
-        z_flat = z_t.view(b, -1)
-        
-        # 1. Embed Tokens
-        x = self.token_embedding(z_flat) # (B, 256, D)
-        
-        # 2. Add Positional Embeddings
-        x = x + self.pos_embedding
-        
-        # 3. Inject Action Information
-        # Compute the expected action embedding using the probabilities from the Inverse Model
-        # action_probs: (B, NUM_ACTIONS)
-        # action_emb_matrix: (NUM_ACTIONS, D)
-        act_emb = torch.matmul(action_probs, self.action_embedding.weight) # (B, D)
-        act_emb = act_emb.unsqueeze(1) # (B, 1, D)
-        
-        # Broadcast action to all tokens (Conditioning)
-        # Alternatively, we could prepend it as a token, but adding it preserves length.
-        x = x + act_emb 
-        
-        # 4. Transformer Pass
-        # We don't use a causal mask here because we are predicting t+1 from t (all-to-all attention is fine)
-        feat = self.transformer(x)
-        
-        # 5. Predict Next Tokens
-        logits = self.head(feat) # (B, 256, Vocab)
-        
-        return logits
+        B = z_t.shape[0]
+        x = self.embedding(z_t.view(B, -1)) + self.pos_emb
+        act_v = self.action_emb(action_probs).unsqueeze(1)
+        x = x + act_v 
+        out = self.transformer(x)
+        return self.head(out).view(B, 16, 16, VOCAB_SIZE)
 
-# --- 3. TRAINING LOOP ---
+# --- MAIN ---
 def main():
-    print(f"Running TRANSFORMER Dynamics training on {DEVICE}")
-    
-    # Increased limit to 10k to provide enough variety for the Transformer
-    dataset = TokenTransitionsDataset(DATA_PATH, limit=10000) 
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    print(f"Step 2: Training (Entropy Lambda={ENTROPY_WEIGHT})...")
+    dataset = TokenTransitionsDataset(DATA_PATH, limit=5000)
+    if len(dataset) == 0: return
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
     
     action_net = ActionRecognitionNet().to(DEVICE)
     world_model = WorldModelTransformer().to(DEVICE)
-    
-    optimizer = torch.optim.Adam(
-        list(action_net.parameters()) + list(world_model.parameters()), 
-        lr=LEARNING_RATE
-    )
-    
+    optimizer = optim.Adam(list(action_net.parameters()) + list(world_model.parameters()), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
-    
-    print("Starting Training (NO ENTROPY REGULARIZATION)...")
-    action_net.train()
-    world_model.train()
     
     for epoch in range(EPOCHS):
         total_loss = 0
-        total_recon = 0
-        correct_actions = 0
-        total_samples = 0
+        total_acc = 0
+        total_ent = 0
         
-        for curr_z, next_z, real_act in dataloader:
-            curr_z, next_z, real_act = curr_z.to(DEVICE), next_z.to(DEVICE), real_act.to(DEVICE)
-            
+        for z_t, z_next, real_act in dataloader:
+            z_t, z_next, real_act = z_t.to(DEVICE), z_next.to(DEVICE), real_act.to(DEVICE)
             optimizer.zero_grad()
             
-            # 1. Infer Action (Inverse Dynamics)
-            action_logits = action_net(curr_z, next_z)
-            action_probs = F.softmax(action_logits, dim=1) # Differentiable bottleneck
+            action_logits = action_net(z_t, z_next)
+            action_probs = torch.softmax(action_logits, dim=1)
+            pred_logits = world_model(z_t, action_probs)
             
-            # 2. Predict Future (Forward Dynamics)
-            # Pass gradients through action_probs to train the ActionNet
-            pred_next_logits = world_model(curr_z, action_probs)
+            loss_recon = criterion(pred_logits.view(-1, VOCAB_SIZE), z_next.view(-1))
             
-            # 3. Calculate Losses
-            # Flatten for CrossEntropy: (B*256, Vocab) vs (B*256)
-            recon_loss = criterion(
-                pred_next_logits.view(-1, TOKEN_VOCAB), 
-                next_z.view(-1)
-            )
+            # Entropy calculation
+            log_probs = torch.log_softmax(action_logits, dim=1)
+            entropy = -(action_probs * log_probs).sum(dim=1).mean()
             
-            # --- NO ENTROPY REGULARIZATION ---
-            # Removed the entropy term to force the model to minimize reconstruction error by finding meaningful actions, rather than maximizing randomness.
-            loss = recon_loss 
+            # Total Loss (Reduced weight)
+            loss = loss_recon + (ENTROPY_WEIGHT * entropy)
             
             loss.backward()
             optimizer.step()
-            
             total_loss += loss.item()
-            total_recon += recon_loss.item()
+            total_ent += entropy.item()
+            total_acc += (torch.argmax(action_probs, dim=1) == real_act.squeeze()).float().mean().item()
             
-            # Calculate Accuracy (for monitoring purposes only)
-            # This checks if the learned latent actions map to real keyboard inputs
-            pred_act = torch.argmax(action_logits, dim=1)
-            correct_actions += (pred_act == real_act).sum().item()
-            total_samples += real_act.size(0)
-            
-        acc = correct_actions / total_samples
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss/len(dataloader):.4f} | Acc Real: {acc:.2%} (Chance: {100/NUM_LATENT_ACTIONS:.1f}%)")
+        avg_ent = total_ent/len(dataloader)
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss/len(dataloader):.4f} (Ent: {avg_ent:.4f}) | Acc: {total_acc/len(dataloader)*100:.1f}%")
 
-    # --- SAVE ---
     torch.save(action_net.state_dict(), ARTIFACTS_PATH / "action_net_transformer.pth")
     torch.save(world_model.state_dict(), ARTIFACTS_PATH / "world_model_transformer.pth")
-    print("Models saved.")
-
-    # --- EVALUATION ---
-    print("Generating Confusion Matrix...")
-    action_net.eval()
-    all_pred = []
-    all_real = []
     
+    print("Generating Viz...")
+    action_net.eval()
+    all_preds, all_real = [], []
     with torch.no_grad():
-        for curr_z, next_z, real_act in dataloader:
-            curr_z, next_z = curr_z.to(DEVICE), next_z.to(DEVICE)
-            logits = action_net(curr_z, next_z)
-            pred = torch.argmax(logits, dim=1).cpu().numpy()
-            all_pred.extend(pred)
-            all_real.extend(real_act.numpy())
+        for z_t, z_next, real_act in dataloader:
+            z_t, z_next = z_t.to(DEVICE), z_next.to(DEVICE)
+            all_preds.extend(torch.argmax(action_net(z_t, z_next), dim=1).cpu().numpy())
+            all_real.extend(real_act.squeeze().numpy())
             
-    cm = confusion_matrix(all_real, all_pred)
+    cm = confusion_matrix(all_real, all_preds)
     plt.figure(figsize=(10, 8))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-    plt.title('Latent Action Discovery (NO REGULARIZATION)')
-    plt.xlabel('Discovered Cluster')
     plt.ylabel('Ground Truth Action')
+    plt.xlabel('Discovered Cluster')
+    plt.title(f'Latent Action Discovery (Entropy w={ENTROPY_WEIGHT})')
     plt.savefig(ARTIFACTS_PATH / "transformer_confusion_matrix.png")
+    
+    try:
+        import generate_dream_gif
+        generate_dream_gif.generate_gif(VQVAE().to(DEVICE), world_model)
+    except: pass
 
 if __name__ == "__main__":
     main()
