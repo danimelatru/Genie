@@ -1,103 +1,87 @@
-# Mini-Genie: Latent Action World Models 🧞‍♂️
+# 🧞‍♂️ Mini-Genie: Unsupervised World Models from Video
 
-A generative World Model that learns to play and simulate **MiniGrid** environments from pixels, without access to ground-truth actions. Inspired by the Google Genie paper, this implementation uses a causal transformer to discover latent physical actions and simulate future trajectories.
+**Mini-Genie** is a PyTorch implementation of the **Genie (Generative Interactive Environments)** architecture. It solves a fundamental challenge in AI: *learning a playable world model purely from unlabelled video data.*
 
----
-
-## 🧠 Architecture
-
-The system consists of three main components designed for visual understanding and temporal reasoning:
-
-1.  **The Eyes (VQ-VAE with EMA)**
-    Compresses 64×64 game frames into a 16×16 grid of discrete tokens.
-    -   **Improvement**: Uses **Exponential Moving Average (EMA)** and codebook resetting to prevent cluster collapse, resulting in significantly sharper and more stable reconstructions.
-    -   **Loss Enhancement**: Combines MSE with **LPIPS (Perceptual Loss)** to preserve fine-grained details of the agent and environment.
-
-2.  **The Brain (Sliding-Window Transformer)**
-    Learns the world's dynamics by observing frame sequences.
-    -   **Temporal Context**: Instead of simple transitions, the model now uses a **Context Window (W=4)**. This allows the transformer to understand velocity, direction, and long-term dependencies.
-    -   **Latent Action Discovery**: An `ActionRecognitionNet` infers actions from state changes ($z_t, z_{t+1}$), and the dynamics model uses these discovered concepts to "dream" consistent futures.
-
-3.  **The Dream (Autoregressive Generator)**
-    Hallucinates future frames by sliding its temporal window forward. By feeding its own discrete predictions back into the transformer, the model can simulate long trajectories purely from imagination.
+Without any action labels or physics engines, Mini-Genie learns to:
+1.  **See**: Compressing video into discrete tokens.
+2.  **Act**: Inferring latent actions (what changed between frames?).
+3.  **Dream**: Predicting future states in an interactive loop.
 
 ---
 
-## 📊 Results
+## 🔮 Results: Dream vs. Reality
 
-### 1. Latent Action Discovery
-The model successfully clusters agent behaviors (turning, moving forward) into distinct latent categories using entropy regularization.
+The core capability of Mini-Genie is "dreaming" plausible futures. Below is a comparison between a **hallucinated trajectory** (left) generated entirely by the model, and a **real episode** (right) from the dataset.
 
-![t-SNE Latent Space](assets/action_latent_space_tsne.png)
+<div align="center">
+  <table>
+    <tr>
+      <td align="center"><strong>🤖 Generated Dream (World Model)</strong></td>
+      <td align="center"><strong>📺 Real Episode (Ground Truth)</strong></td>
+    </tr>
+    <tr>
+      <td><img src="assets/dream_generated.gif" width="300" alt="Generated Dream"></td>
+      <td><img src="assets/vqvae_diagnostic_original.gif" width="300" alt="Real Episode"></td>
+    </tr>
+  </table>
+  <p><em>Note how the World Model maintains spatial coherence and physics-like transitions similar to the real game.</em></p>
+</div>
 
-### 2. Dreaming the Future
-Example of the agent “dreaming” a 50-frame trajectory. Note the temporal consistency achieved through the windowed context.
+### 🧠 Latent Action Space
+How does the model control this world? By discovering **Latent Actions**. The t-SNE plot below shows how the model unsupervisedly clusters frame transitions into distinct "moves" (e.g., jump, move right, stay).
 
-![Dream GIF](assets/dream_real_data.gif)
+<div align="center">
+  <img src="assets/action_latent_space_tsne.png" width="500" alt="Latent Action Space">
+</div>
 
 ---
 
-## 🚀 How to Run
+## 🏗️ Architecture
 
-### 1. Installation
+Mini-Genie implements the three-stage pipeline defined in the Genie paper:
 
+### 1. Spatiotemporal Tokenizer (VQ-VAE)
+*   **Goal**: Compress high-dimensional video ($T \times H \times W$) into compact discrete tokens ($T \times h \times w$).
+*   **Tech**: Custom VQ-VAE with 512 codebook entries.
+*   **Result**: Reduces dimensionality while preserving semantic visual information.
+
+### 2. Latent Action Model (LAM)
+*   **Goal**: Learn *what* happened between two frames $x_t$ and $x_{t+1}$ without labels.
+*   **Tech**: VQ-VAE style encoder that discretizes frame differences into $K$ finite action codes.
+*   **Optimization**: Uses Entropy Regularization to prevent "mode collapse" (ensuring the model uses all available actions).
+
+### 3. Dynamics Model (The "Brain")
+*   **Goal**: Predict the next token frame $z_{t+1}$ given history and the latent action $a_t$.
+*   **Tech**: A **CNN-Based Residual Forecaster**. Unlike the original paper's Transformer, we utilize a convolutional architecture to strictly enforce spatial coherence on smaller datasets, preventing "pixel soup" hallucinations.
+
+---
+
+## 🚀 Quick Start
+
+### Installation
 ```bash
-conda create -n mini-genie python=3.10
-conda activate mini-genie
+git clone https://github.com/yourusername/mini-genie.git
+cd mini-genie
 pip install -r requirements.txt
-pip install gym-minigrid
 ```
 
----
-
-### 2. Full Training Pipeline
-
-The project follows a staged training approach. You can run the entire pipeline with a single command:
-
+### Automatic Pipeline
+Run the full training and generation suite with a single command:
 ```bash
 bash scripts/fix_and_train.sh
 ```
 
-This script performs the following:
-1.  **Tokenization**: Converts raw pixel data into discrete VQ-VAE tokens.
-2.  **Dynamics Training**: Trains the Transformer using windowed sequences.
-3.  **Visualization**: Generates t-SNE plots and the "dream" GIF.
-
-### 3. Manual Steps (Optional)
-
--   **Record Data**: `python src/record_active_data.py` (Default: 1000 episodes).
--   **Train Vision**: `python src/train_vqvae.py` (If you need to improve visual sharpness).
--   **Train Brain**: `python src/train_transformer_dynamics.py`.
+### Project Structure
+*   **`src/train_vqvae.py`**: Trains the visual compressor.
+*   **`src/train_transformer_dynamics.py`**: Trains the LAM and World Model jointly.
+*   **`src/generate_dream_gif.py`**: autoregressively "dreams" a video starting from a seed frame.
 
 ---
 
-## 📂 Project Structure
+## ⚙️ Configuration
+The model is tuned for stability on standard GPUs (tested on A100/V100):
+*   **Learning Rate**: 1e-4 (AdamW)
+*   **Input Window**: 4 frames
+*   **Action Space**: 8 latent codes
 
-```text
-mini-genie/
-├── data/                  # Datasets and Artifacts (Ignored by git)
-│   ├── episodes/          # Raw .npz game recordings
-│   ├── tokens/            # Tokenized episodes (VQ-VAE output)
-│   └── artifacts/         # Saved models (.pth), plots, and GIFs
-├── src/
-│   ├── record_active_data.py       # 1. Environment interaction & data collection
-│   ├── train_vqvae.py              # 2. Visual Compressor (VQ-VAE + EMA)
-│   ├── tokenize_data.py            # 3. Off-line data tokenization
-│   ├── train_transformer_dynamics.py # 4. World Model (Windowed Transformer)
-│   ├── visualize_tsne.py           # 5. Latent Action Analysis
-│   └── generate_dream_gif.py       # 6. Autoregressive Simulation
-└── scripts/               
-    └── fix_and_train.sh            # Complete end-to-end pipeline
-```
-
----
-
-## 🛠 Advanced Configuration
-
-In `src/train_transformer_dynamics.py`, you can tune the following:
--   `WINDOW_SIZE`: Number of frames the model "remembers".
--   `ENTROPY_WEIGHT`: Controls how "spread out" the discovered actions are.
--   `HIDDEN_DIM`: Main capacity of the world model transformer.
-
-> [!NOTE]
-> Training with 1000 episodes and 30 epochs is recommended for consistent physics discovery.
+*Based on the research paper "Genie: Generative Interactive Environments" (DeepMind, 2024).*

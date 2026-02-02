@@ -12,7 +12,7 @@ WINDOW_SIZE = 4 # Match the one in train_transformer_dynamics.py
 VOCAB_SIZE = 512
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PROJECT_ROOT = Path(__file__).parent.parent
-DATA_PATH = PROJECT_ROOT / "data" / "tokens"
+EPISODES_PATH = PROJECT_ROOT / "data" / "episodes"
 ARTIFACTS_PATH = PROJECT_ROOT / "data" / "artifacts"
 DREAM_STEPS = 50       
 DREAM_ACTION_IDX = 0    
@@ -28,7 +28,7 @@ def sample_top_k(logits, k, temperature):
     sample = torch.multinomial(flat_probs, 1)
     return sample.view(logits.shape[:-1])
 
-def generate_gif(vqvae, world_model):
+def generate_gif(vqvae, world_model, output_name="dream_generated.gif"):
     print(f"🎬 Starting Dream Generation (Forcing Action {DREAM_ACTION_IDX})...")
     
     vqvae.eval()
@@ -39,7 +39,7 @@ def generate_gif(vqvae, world_model):
     
     # We need a starting window of frames
     # Let's take the first WINDOW_SIZE frames from an episode
-    episode_files = sorted(list(DATA_PATH.glob("*.npz")))
+    episode_files = sorted(list(EPISODES_PATH.glob("*.npz")))
     if not episode_files:
         print("No episodes found to dream from.")
         return
@@ -52,7 +52,7 @@ def generate_gif(vqvae, world_model):
     frames_torch = torch.from_numpy(frames).permute(0, 3, 1, 2).float().to(DEVICE) / 255.0
     z = vqvae.encoder(frames_torch)
     z = vqvae._pre_vq_conv(z)
-    _, _, z_indices = vqvae.vq_layer(z)
+    _, _, _, z_indices = vqvae.vq_layer(z)  # Now returns 4 values
     z_indices = z_indices.view(WINDOW_SIZE, 16, 16) # (W, 16, 16)
     
     current_window = z_indices.clone().unsqueeze(0) # (1, W, 16, 16)
@@ -92,23 +92,24 @@ def generate_gif(vqvae, world_model):
             # In our updated VQVAE: self.embedding (public)
             quantized = vqvae.vq_layer.embedding(tz_torch).view(1, 16, 16, 64).permute(0, 3, 1, 2)
             recon = vqvae.decoder(quantized)
-            img = (recon.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            img = (recon.squeeze().permute(1, 2, 0).cpu().numpy() * 255)
+            img = np.clip(img, 0, 255).astype(np.uint8)
             decoded_frames.append(img)
 
     # 4. Save GIF
-    save_path = ARTIFACTS_PATH / "dream_real_data.gif"
+    save_path = ARTIFACTS_PATH / output_name
     imageio.mimsave(save_path, decoded_frames, fps=10)
     print(f"✅ GIF saved to {save_path}")
 
 if __name__ == "__main__":
     try:
         from train_vqvae import VQVAE
-        from train_transformer_dynamics import WorldModelTransformer
+        from train_transformer_dynamics import WorldModelCNN
         
         vqvae = VQVAE().to(DEVICE)
         vqvae.load_state_dict(torch.load(ARTIFACTS_PATH / "vqvae.pth", map_location=DEVICE))
         
-        wm = WorldModelTransformer().to(DEVICE)
+        wm = WorldModelCNN().to(DEVICE)
         wm.load_state_dict(torch.load(ARTIFACTS_PATH / "world_model_transformer.pth", map_location=DEVICE))
         
         generate_gif(vqvae, wm)

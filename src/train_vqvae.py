@@ -10,7 +10,7 @@ import lpips
 import sys
 
 # --- CONFIG ---
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 LEARNING_RATE = 1e-3  
 EPOCHS = 20
 EMBED_DIM = 64
@@ -77,6 +77,9 @@ class VectorQuantizer(nn.Module):
         self.register_buffer('_ema_cluster_size', torch.zeros(num_embeddings))
         self._ema_w = nn.Parameter(torch.Tensor(num_embeddings, self._embedding_dim))
         self._ema_w.data.normal_()
+        
+        # Track usage for codebook reset
+        self.register_buffer('_code_usage', torch.zeros(num_embeddings))
 
     def forward(self, inputs):
         # Convert inputs from BCHW -> BHWC
@@ -101,6 +104,9 @@ class VectorQuantizer(nn.Module):
         
         # Use EMA to update the embedding vectors
         if self.training:
+            # Update usage tracking
+            self._code_usage += torch.sum(encodings, 0)
+            
             self._ema_cluster_size = self._ema_cluster_size * self._decay + \
                                      (1 - self._decay) * torch.sum(encodings, 0)
             
@@ -125,6 +131,30 @@ class VectorQuantizer(nn.Module):
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
         
         return loss, quantized.permute(0, 3, 1, 2).contiguous(), perplexity, encoding_indices
+    
+    def reset_unused_codes(self, encoder_outputs):
+        """Reset codes that haven't been used much with random encoder outputs."""
+        with torch.no_grad():
+            # Find codes used less than 1% of average usage
+            avg_usage = self._code_usage.mean()
+            threshold = avg_usage * 0.01
+            unused_mask = self._code_usage < threshold
+            n_unused = unused_mask.sum().item()
+            
+            if n_unused > 0:
+                # Sample random encoder outputs
+                random_indices = torch.randint(0, encoder_outputs.shape[0], (n_unused,))
+                random_codes = encoder_outputs[random_indices]
+                
+                # Reset the unused codes
+                self.embedding.weight.data[unused_mask] = random_codes
+                self._ema_w.data[unused_mask] = random_codes
+                self._ema_cluster_size[unused_mask] = 1.0
+                
+                print(f"  → Reset {n_unused} unused codes (threshold: {threshold:.1f}, avg: {avg_usage:.1f})")
+            
+            # Reset usage counter
+            self._code_usage.zero_()
 
 class Encoder(nn.Module):
     def __init__(self, in_channels, num_hiddens, num_residual_layers, num_residual_hiddens):
@@ -181,52 +211,88 @@ class VQVAE(nn.Module):
     def forward(self, x):
         z = self.encoder(x)
         z = self._pre_vq_conv(z)
-        loss, quantized, perplexity = self.vq_layer(z) 
-        return loss, quantized, perplexity 
+        loss, quantized, perplexity, encoding_indices = self.vq_layer(z) 
+        return loss, quantized, perplexity, encoding_indices 
 
 # --- TRAINING ---
 def main():
+    import gc
+    # Pre-training cleanup
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    # Standard benchmark for fixed input sizes (64x64)
+    torch.backends.cudnn.benchmark = True 
+    
     print(f"Training VQ-VAE (LPIPS + Spatial Loss) on {DEVICE}")
     
     dataset = LowRAMEpisodesDataset(DATA_PATH)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=False)
+    # Using 4 workers and pin_memory for better throughput on cluster/A100
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=4)
     
     model = VQVAE().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
-    print("Loading LPIPS...")
+    print("Loading LPIPS (frozen)...")
     lpips_fn = lpips.LPIPS(net='vgg').to(DEVICE) 
+    lpips_fn.eval()
+    for param in lpips_fn.parameters():
+        param.requires_grad = False
     
     print("Starting Training...")
     model.train()
     
     for epoch in range(EPOCHS):
         total_loss = 0
+        total_perplexity = 0
+        encoder_outputs_for_reset = []
+        
         for i, images in enumerate(dataloader):
             images = images.to(DEVICE)
             optimizer.zero_grad()
             
-            vq_loss, quantized, _ = model(images)[0:3]
+            # Unpack the 4 values returned by our updated VQ-VAE
+            vq_loss, quantized, perplexity, _ = model(images)
             recon_images = model.decoder(quantized)
             
+            # Store encoder outputs for potential codebook reset
+            if epoch > 0 and i == 0:
+                with torch.no_grad():
+                    z = model.encoder(images)
+                    z = model._pre_vq_conv(z)
+                    z_flat = z.permute(0, 2, 3, 1).contiguous().view(-1, EMBED_DIM)
+                    encoder_outputs_for_reset = z_flat[:1000]  # Keep 1000 samples
+            
+            # Weighted reconstruction loss (focus on non-empty areas)
             weights = torch.ones_like(images)
             weights[images > 0.05] = 10.0
             
             recon_loss = (F.l1_loss(recon_images, images, reduction='none') * weights).mean()
+            
+            # LPIPS perceptual loss (no grad calculation for the vgg trunk)
             p_loss = lpips_fn(recon_images * 2 - 1, images * 2 - 1).mean()
             
             loss = recon_loss + vq_loss + 0.5 * p_loss
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
             
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss/len(dataloader):.4f}")
+            total_loss += loss.item()
+            total_perplexity += perplexity.item()
+            
+        avg_loss = total_loss / len(dataloader)
+        avg_ppl = total_perplexity / len(dataloader)
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {avg_loss:.4f} | Perplexity: {avg_ppl:.2f}/{NUM_EMBEDDINGS}")
         
-        if (epoch+1) % 5 == 0:
+        # Reset unused codes every 5 epochs
+        if (epoch+1) % 5 == 0 and len(encoder_outputs_for_reset) > 0:
+            model.vq_layer.reset_unused_codes(encoder_outputs_for_reset)
             torch.save(model.state_dict(), ARTIFACTS_PATH / "vqvae.pth")
-
+        
     torch.save(model.state_dict(), ARTIFACTS_PATH / "vqvae.pth")
-    print("Training Complete.")
+    # Final cleanup
+    torch.cuda.empty_cache()
+    gc.collect()
+    print("Memory cleared. Training Complete.")
 
 if __name__ == "__main__":
     main()

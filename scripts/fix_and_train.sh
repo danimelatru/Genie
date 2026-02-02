@@ -20,21 +20,25 @@ echo "----------------------------------------------------------------"
 echo "🧹 Step 1: Removing old Transformer checkpoints..."
 rm -f data/artifacts/action_net_transformer.pth
 rm -f data/artifacts/world_model_transformer.pth
-# Note: We KEEP the VQ-VAE (eyes) because it works fine.
+# Note: We KEEP the VQ-VAE.
 echo "   Done. Old brains removed."
+
+# 0. VQ-VAE Diagnostic (Verify reconstruction before training)
+echo "--- Step 0: Running VQ-VAE Diagnostic ---"
+$PYTHON_EXEC -u src/diagnostic_vqvae.py
 
 # 1. Tokenize Data (Uses the VQ-VAE to convert images to codebook indices)
 echo "--- Step 1: Tokenizing Episodes ---"
-python src/tokenize_data.py
+$PYTHON_EXEC -u src/tokenize_data.py
 
-# 2. Train Transformer Dynamics (The "Brain")
-echo "--- Step 2: Training Transformer Dynamics (Window size = 4) ---"
-python src/train_transformer_dynamics.py
+# 2. Train CNN Dynamics (The "Brain" - now using CNN architecture)
+echo "--- Step 2: Training CNN WorldModel (Window size = 4) ---"
+$PYTHON_EXEC -u src/train_transformer_dynamics.py
 
 # 3. Visualization (t-SNE and Dreams)
 echo "--- Step 3: Generating Visualizations ---"
-python src/visualize_tsne.py
-python src/generate_dream_gif.py
+$PYTHON_EXEC -u src/visualize_tsne.py
+$PYTHON_EXEC -u src/generate_dream_gif.py
 
 echo "----------------------------------------------------------------"
 echo "✅ PIPELINE FINISHED"

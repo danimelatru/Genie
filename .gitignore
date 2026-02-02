@@ -40,8 +40,8 @@ datasets/
 *.pt
 *.checkpoint
 
-# Vision/Results (Keep small assets, ignore large generated ones if necessary)
-# assets/
+# Assets (Track these for GitHub)
+assets/
 !assets/*.png
 !assets/*.gif
 

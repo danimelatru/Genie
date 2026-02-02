@@ -19,16 +19,17 @@ except ImportError:
     from train_vqvae import VQVAE
 
 # --- CONFIG ---
-BATCH_SIZE = 32
-LEARNING_RATE = 1e-4
+BATCH_SIZE = 128  # Increased for A100 efficiency
+LEARNING_RATE = 1e-4  # Aligned with Genie paper recommendation
+EPOCHS = 5  # Reduced from 20 - model converges by epoch 2-3
 WINDOW_SIZE = 4
 VOCAB_SIZE = 512
 NUM_ACTIONS = 8
-ENTROPY_WEIGHT = 0.01
+ENTROPY_WEIGHT = 0.1
 EMBED_DIM = 64
-HIDDEN_DIM = 512
+HIDDEN_DIM = 256  # Reduced from 512 for faster training
 NUM_HEADS = 8
-NUM_LAYERS = 6
+NUM_LAYERS = 2  # Reduced from 6 for speed
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -46,7 +47,9 @@ class TokenTransitionsDataset(Dataset):
         
         print(f"Loading {len(self.files)} episodes for windowed training (window={window_size})...")
         
-        for f in self.files:
+        for idx, f in enumerate(self.files):
+            if idx % 100 == 0 and idx > 0:
+                print(f"  Processed {idx}/{len(self.files)} episodes, {len(self.data)} sequences so far...")
             try:
                 tokens = np.load(f) # (T, 16, 16)
                 if len(tokens.shape) != 3: continue
@@ -71,7 +74,7 @@ class TokenTransitionsDataset(Dataset):
                 print(f"Error loading {f}: {e}")
                 continue
         
-        print(f"Total Sequences: {len(self.data)}")
+        print(f"✅ Total Sequences: {len(self.data)}")
 
     def __len__(self):
         return len(self.data)
@@ -109,62 +112,102 @@ class ActionRecognitionNet(nn.Module):
         x = torch.cat([emb_prev, emb_next], dim=1)
         return self.head(self.conv_net(x))
 
-class WorldModelTransformer(nn.Module):
+class WorldModelCNN(nn.Module):
+    """CNN-based World Model that naturally preserves spatial structure.
+    
+    Uses 2D convolutions which inherently maintain local spatial coherence,
+    instead of treating each position independently like the Transformer did.
+    """
     def __init__(self):
         super().__init__()
-        self.embedding = nn.Embedding(VOCAB_SIZE, HIDDEN_DIM)
-        self.action_emb = nn.Linear(NUM_ACTIONS, HIDDEN_DIM)
-        # Position embedding for 16x16 grid + temporal encoding
-        self.pos_emb = nn.Parameter(torch.randn(1, 16*16, HIDDEN_DIM))
-        self.temp_emb = nn.Parameter(torch.randn(1, WINDOW_SIZE, HIDDEN_DIM))
         
-        encoder_layer = nn.TransformerEncoderLayer(d_model=HIDDEN_DIM, nhead=NUM_HEADS, batch_first=True, dim_feedforward=HIDDEN_DIM*4)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=NUM_LAYERS)
-        self.head = nn.Linear(HIDDEN_DIM, VOCAB_SIZE)
+        # Token embedding: convert discrete tokens to dense vectors
+        self.token_emb = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
+        
+        # Action embedding: project action to spatial feature map
+        self.action_fc = nn.Linear(NUM_ACTIONS, 16 * 16)
+        
+        # Input channels: W frames * EMBED_DIM + 1 action channel
+        input_channels = WINDOW_SIZE * EMBED_DIM + 1
+        
+        # CNN encoder with residual connections
+        self.conv1 = nn.Conv2d(input_channels, 128, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+        
+        # Residual projection (for skip connection)
+        self.residual_proj = nn.Conv2d(input_channels, 256, kernel_size=1)
+        
+        # Output head: predict token logits for each position
+        self.head = nn.Conv2d(256, VOCAB_SIZE, kernel_size=1)
+        
+        self.activation = nn.GELU()
+        self.norm1 = nn.BatchNorm2d(128)
+        self.norm2 = nn.BatchNorm2d(256)
+        self.norm3 = nn.BatchNorm2d(256)
 
     def forward(self, z_seq, action_probs):
-        # z_seq: (B, W, 16, 16)
+        """
+        Args:
+            z_seq: (B, W, 16, 16) - window of token indices
+            action_probs: (B, 8) - action probabilities (one-hot or soft)
+        Returns:
+            logits: (B, 16, 16, VOCAB_SIZE) - next frame token predictions
+        """
         B, W, H, W_grid = z_seq.shape
         
-        # Embed each frame and add spatial position
-        # Reshape to (B*W, 16*16, HIDDEN_DIM)
-        x = self.embedding(z_seq.view(B * W, -1)) + self.pos_emb
+        # 1. Embed tokens: (B, W, 16, 16) -> (B, W, 16, 16, EMBED_DIM)
+        z_emb = self.token_emb(z_seq)
         
-        # Mean pool or flatten the spatial dimensions? 
-        # For dynamics, we want to keep spatial if possible, but the sequence is (B, W, H, W, D)
-        # Let's flatten spatial and keep temporal
-        x = x.view(B, W, H * W_grid, HIDDEN_DIM)
+        # 2. Reshape for convolution: (B, W*EMBED_DIM, 16, 16)
+        z_emb = z_emb.permute(0, 1, 4, 2, 3)  # (B, W, EMBED_DIM, 16, 16)
+        z_emb = z_emb.reshape(B, W * EMBED_DIM, H, W_grid)
         
-        # Add temporal embedding to each frame's representation
-        x = x + self.temp_emb.unsqueeze(2)
+        # 3. Create action feature map: (B, 1, 16, 16)
+        act_map = self.action_fc(action_probs).view(B, 1, 16, 16)
         
-        # Flatten temporal and spatial: (B, W*H*W_grid, HIDDEN_DIM)
-        x = x.view(B, W * H * W_grid, HIDDEN_DIM)
+        # 4. Concatenate: (B, W*EMBED_DIM + 1, 16, 16)
+        x = torch.cat([z_emb, act_map], dim=1)
         
-        # Inject action (broadcasted to all tokens in the sequence)
-        act_v = self.action_emb(action_probs).unsqueeze(1)
-        x = x + act_v 
+        # 5. Save input for residual connection
+        residual = self.residual_proj(x)
         
-        out = self.transformer(x)
+        # 6. Process through CNN layers with residual connections
+        x = self.activation(self.norm1(self.conv1(x)))
+        x = self.activation(self.norm2(self.conv2(x)))
+        x = self.activation(self.norm3(self.conv3(x)))
+        x = self.conv4(x)
         
-        # Map back to 16x16 grid for the NEXT frame (target is just one frame)
-        # We take the representation corresponding to the LAST frame in the window
-        last_frame_out = out.view(B, W, H * W_grid, HIDDEN_DIM)[:, -1, :, :]
+        # 7. Add residual connection
+        x = x + residual
+        x = self.activation(x)
         
-        return self.head(last_frame_out).view(B, 16, 16, VOCAB_SIZE)
+        # 8. Output logits: (B, VOCAB_SIZE, 16, 16)
+        logits = self.head(x)
+        
+        # 9. Reshape to match expected output: (B, 16, 16, VOCAB_SIZE)
+        return logits.permute(0, 2, 3, 1)
 
 # --- MAIN ---
 def main():
-    print(f"Step 2: Training (Entropy Lambda={ENTROPY_WEIGHT})...")
-    dataset = TokenTransitionsDataset(DATA_PATH, limit=5000)
-    if len(dataset) == 0: return
+    print(f"Training Transformer Dynamics (Window={WINDOW_SIZE}) on {DEVICE}")
+    print(f"Entropy Lambda: {ENTROPY_WEIGHT} | Learning Rate: {LEARNING_RATE}")
+    
+    dataset = TokenTransitionsDataset(DATA_PATH, window_size=WINDOW_SIZE, limit=1000)
+    if len(dataset) == 0:
+        print("❌ No data found!")
+        return
+    
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    print(f"Loaded {len(dataset)} sequences, {len(dataloader)} batches per epoch.")
     
     action_net = ActionRecognitionNet().to(DEVICE)
-    world_model = WorldModelTransformer().to(DEVICE)
-    optimizer = optim.Adam(list(action_net.parameters()) + list(world_model.parameters()), lr=LEARNING_RATE)
+    world_model = WorldModelCNN().to(DEVICE)
+    optimizer = optim.AdamW(list(action_net.parameters()) + list(world_model.parameters()), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
     
+    print("Starting Training...")
     for epoch in range(EPOCHS):
         total_loss = 0
         total_acc = 0
@@ -179,26 +222,28 @@ def main():
             action_logits = action_net(z_last, z_next)
             action_probs = torch.softmax(action_logits, dim=1)
             
+            # Supervised action loss: predict the real action that caused the transition
+            target_act = real_act[:, -1]  # The action that led to z_next
+            loss_action = criterion(action_logits, target_act)
+            
             # Predict next frame from sequence + action
             pred_logits = world_model(z_seq, action_probs)
             
-            loss_recon = criterion(pred_logits.view(-1, VOCAB_SIZE), z_next.view(-1))
+            loss_recon = criterion(pred_logits.reshape(-1, VOCAB_SIZE), z_next.reshape(-1))
             
             # Entropy calculation for latent actions
             log_probs = torch.log_softmax(action_logits, dim=1)
             entropy = -(action_probs * log_probs).sum(dim=1).mean()
             
-            # Total Loss
-            loss = loss_recon + (ENTROPY_WEIGHT * entropy)
+            # Total Loss: reconstruction + action prediction - entropy regularization
+            loss = loss_recon + loss_action - (ENTROPY_WEIGHT * entropy)
             
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
             total_ent += entropy.item()
             
-            # For accuracy, take the last action in the sequence or the real_act if it's the target action
-            # The dataset provides seq_actions where real_act is the one that led to z_next
-            target_act = real_act[:, -1]
+            # Accuracy: how well we predict the real action
             total_acc += (torch.argmax(action_probs, dim=1) == target_act).float().mean().item()
             
         avg_ent = total_ent/len(dataloader)
@@ -227,7 +272,7 @@ def main():
     
     try:
         import generate_dream_gif
-        generate_dream_gif.generate_gif(VQVAE().to(DEVICE), world_model)
+        generate_dream_gif.generate_gif(VQVAE().to(DEVICE), world_model, "dream_during_training.gif")
     except: pass
 
 if __name__ == "__main__":

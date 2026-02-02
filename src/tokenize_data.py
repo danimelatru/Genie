@@ -55,12 +55,11 @@ def main():
                 z = vqvae.encoder(frames_torch)
                 z = vqvae._pre_vq_conv(z)
                 
-                # Get indices from the quantization layer
-                _, _, indices = vqvae.vq_layer(z)
+                # Get indices from the quantization layer (now returns 4 values)
+                _, _, _, indices = vqvae.vq_layer(z)
                 
                 # Reshape indices to (T, 16, 16)
-                # indices comes out as (B*H*W, 1) or similar depending on implementation
-                # Based on your VQVAE code: encoding_indices is (B*H*W, 1)
+                # indices comes out as (B*H*W, 1)
                 # We need to reshape it back to the grid
                 indices = indices.view(len(frames), 16, 16).cpu().numpy().astype(np.uint16)
 
