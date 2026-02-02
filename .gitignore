@@ -40,11 +40,6 @@ datasets/
 *.pt
 *.checkpoint
 
-# Assets (Track these for GitHub)
-assets/
-!assets/*.png
-!assets/*.gif
-
 # Logs
 logs/
 *.log
@@ -62,3 +57,6 @@ slurm-*.err
 .idea/
 *.swp
 *.swo
+
+# Agent internal files
+.agent/

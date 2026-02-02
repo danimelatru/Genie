@@ -4,6 +4,7 @@
 #SBATCH --time=04:00:00
 #SBATCH --partition=gpua100
 #SBATCH --gres=gpu:1
+#SBATCH --exclude=ruche-gpu11,ruche-gpu16,ruche-gpu17,ruche-gpu19
 
 # --- ENVIRONMENT SETUP ---
 module purge
